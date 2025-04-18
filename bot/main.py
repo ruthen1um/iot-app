@@ -6,12 +6,29 @@ import serial
 import serial.tools.list_ports
 import time
 
-PORT = "C3"  
+
+
+PORT = None  
+
+
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        if "Arduino" in port.description or "USB-SERIAL" in port.description or "CH340" in port.description:
+            return port.device
+    return None
+
+if PORT is None:
+    PORT = find_arduino_port()
+    if PORT is None:
+        raise Exception("Arduino-порт не найден. УкажиТЕ PORT вручную.")
+
+ser = serial.Serial(PORT, 9600, timeout=1)
 
 
 last_temperature = None
 last_humidity = None
-last_read_time = 
+last_read_time = 0  
 
 def _update_sensor_data():
     global last_temperature, last_humidity, last_read_time
@@ -47,9 +64,6 @@ def get_temperature() -> float:
 def get_humidity() -> float:
     _update_sensor_data()
     return last_humidity
-
-
-
 
 
 TOKEN = getenv('TOKEN')
