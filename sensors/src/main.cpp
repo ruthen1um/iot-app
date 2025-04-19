@@ -3,23 +3,27 @@
 
 HTU21D sensor;
 
+unsigned long previousMillis = 0;
+const unsigned long interval = 60000;  // 60 секунд
+
 void setup() {
-  Serial.begin(9600);
-  sensor.begin();
+    Serial.begin(9600);
+    sensor.begin();
 }
 
 void loop() {
-  if(sensor.measure()) {
-    float temperature = sensor.getTemperature();
-    float humidity = sensor.getHumidity();
-    
-    Serial.print("Temperature (°C): ");
-    Serial.println(temperature);
-    
-    Serial.print("Humidity (%RH): ");
-    Serial.println(humidity);
-  }
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis;
 
-  delay(5000);
+        if (sensor.measure()) {
+            float temperature = sensor.getTemperature();
+            float humidity = sensor.getHumidity();
+
+            Serial.print("T:");
+            Serial.println(temperature, 2);
+            Serial.print("H:");
+            Serial.println(humidity, 2);
+        }
+    }
 }
-

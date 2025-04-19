@@ -9,6 +9,8 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+from sensors import find_arduino_port, get_temperature, get_humidity
+from serial import Serial
 
 TOKEN = getenv('TOKEN')
 PERSISTENCE_FILE = getenv('PERSISTENCE_FILE')
@@ -58,16 +60,6 @@ REMINDER_KEYBOARD = [
 REMINDER_MARKUP = ReplyKeyboardMarkup(REMINDER_KEYBOARD, resize_keyboard=True)
 
 
-def get_temperature():
-    # TODO: implement this function
-    pass
-
-
-def get_humidity():
-    # TODO: implement this function
-    pass
-
-
 async def start_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -83,8 +75,10 @@ async def sensors_handler(
     context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     functions = {
-        'Температура': get_temperature,
-        'Влажность': get_humidity,
+        'Температура': lambda:
+            get_temperature(context.application.bot_data['serial']),
+        'Влажность': lambda:
+            get_humidity(context.application.bot_data['serial']),
     }
     await context.bot.send_message(chat_id=update.effective_chat.id,
                                    text=functions[update.message.text]())
@@ -161,6 +155,13 @@ if __name__ == '__main__':
         .persistence(PicklePersistence(filepath=PERSISTENCE_FILE))
         .build()
     )
+
+    port = find_arduino_port()
+    if (port is None):
+        # TODO
+        pass
+
+    application.bot_data['serial'] = Serial(port, 9600, timeout=1)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_handler)],
