@@ -14,20 +14,24 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from dataclasses import dataclass
 from sensors import get_temperature, get_humidity
 from serial import Serial
+from dotenv import load_dotenv
+
+load_dotenv()
 
 TOKEN = getenv('TOKEN')
 PORT = getenv('PORT')
+DATABASE_PATH = getenv('DATABASE_PATH')
 
 # Интервал проверки условий для отправки напоминания
-CHECK_INTERVAL = 10
+CHECK_INTERVAL = getenv('CHECK_INTERVAL')
 
 START_MESSAGE = '''Привет. Данный бот позволяет просматривать значения
 температуры и влажности с датчиков в режиме реального времени'''
 
-
-INIT_SCRIPT = '''
+CREATE_NOTIFICATIONS_TABLE = '''
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -35,17 +39,89 @@ CREATE TABLE IF NOT EXISTS notifications (
     condition TEXT,
     value REAL,
     created_at TIMESTAMP,
-    is_active BOOLEAN DEFAULT 1
+    is_active BOOLEAN
 )
 '''
 
+SELECT_ACTIVE_USER_NOTIFICATIONS = '''
+SELECT * FROM notifications WHERE user_id=? AND is_active=1
+'''
 
-def init_db():
-    db = sqlite3.connect('notifications.db')
-    cursor = db.cursor()
-    cursor.execute(INIT_SCRIPT)
-    db.commit()
-    db.close()
+SELECT_ACTIVE_NOTIFICATIONS = '''
+SELECT * FROM notifications WHERE is_active=1
+'''
+
+INSERT_NOTIFICATION = '''
+INSERT INTO notifications (
+    user_id,
+    parameter,
+    condition,
+    value,
+    created_at,
+    is_active
+) VALUES (?, ?, ?, ?, ?, ?)
+'''
+
+TEMPERATURE_CALLBACK_DATA = 'temperature'
+HUMIDITY_CALLBACK_DATA = 'humidity'
+
+LESS_CONDITION_CALLBACK_DATA = 'less'
+EQUAL_CONDITION_CALLBACK_DATA = 'equal'
+GREATER_CONDITION_CALLBACK_DATA = 'greater'
+
+PARAMETERS_MARKUP = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text='Температура',
+                              callback_data='temperature')],
+        [InlineKeyboardButton(text='Влажность', callback_data='humidity')]
+    ]
+)
+
+CONDITIONS_MARKUP = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text='<', callback_data='less'),
+            InlineKeyboardButton(text='=', callback_data='equal'),
+            InlineKeyboardButton(text='>', callback_data='greater')
+        ],
+        [InlineKeyboardButton(text='Назад', callback_data='back')]
+    ]
+)
+
+
+@dataclass
+class Notification:
+    id: object
+    user_id: object
+    parameter: object
+    condition: object
+    value: object
+    created_at: object
+    is_active: object
+
+    def __str__(self):
+        return (
+            Notification.parameter_to_str(self.parameter) + ' ' +
+            Notification.condition_to_str(self.condition) + ' ' +
+            str(self.value)
+        ).capitalize()
+
+    @staticmethod
+    def parameter_to_str(parameter):
+        parameters = {
+            TEMPERATURE_CALLBACK_DATA: 'температура',
+            HUMIDITY_CALLBACK_DATA: 'влажность',
+        }
+        return parameters.get(parameter)
+
+    @staticmethod
+    def condition_to_str(condition):
+        conditions = {
+            LESS_CONDITION_CALLBACK_DATA: 'меньше',
+            EQUAL_CONDITION_CALLBACK_DATA: 'равна',
+            GREATER_CONDITION_CALLBACK_DATA: 'больше',
+        }
+        return conditions.get(condition)
 
 
 class NotificationStates(StatesGroup):
@@ -59,27 +135,11 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 
-def get_parameters_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text='Температура',
-                                  callback_data='temperature')],
-            [InlineKeyboardButton(text='Влажность', callback_data='humidity')]
-        ]
-    )
-
-
-def get_conditions_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text='<', callback_data='less'),
-                InlineKeyboardButton(text='=', callback_data='equal'),
-                InlineKeyboardButton(text='>', callback_data='greater')
-            ],
-            [InlineKeyboardButton(text='Назад', callback_data='back')]
-        ]
-    )
+def init_db():
+    con = sqlite3.connect(DATABASE_PATH)
+    with con:
+        con.execute(CREATE_NOTIFICATIONS_TABLE)
+    con.close()
 
 
 @dp.message(Command('start'))
@@ -89,23 +149,25 @@ async def command_start_handler(message: Message) -> None:
 
 @dp.message(Command('temperature'))
 async def command_temperature_handler(message: Message) -> None:
-    await message.answer(
-        f'Текущее значение температуры: {get_temperature(ser)}')
+    temperature = get_temperature(ser)
+    await message.answer(f'Текущее значение температуры: {temperature}')
 
 
 @dp.message(Command('humidity'))
 async def command_humidity_handler(message: Message) -> None:
-    await message.answer(f'Текущее значение влажности: {get_humidity(ser)}')
+    humidity = get_humidity(ser)
+    await message.answer(f'Текущее значение влажности: {humidity}')
 
 
 @dp.message(Command('notifications'))
 async def command_notifications_handler(message: Message) -> None:
-    db = sqlite3.connect('notifications.db')
-    cursor = db.cursor()
-    query = 'SELECT * FROM notifications WHERE user_id=? AND is_active=1'
-    cursor.execute(query, (message.from_user.id,))
-    notifications = cursor.fetchall()
-    db.close()
+    con = sqlite3.connect(DATABASE_PATH)
+    with con:
+        parameters = (message.from_user.id,)
+        cur = con.execute(SELECT_ACTIVE_USER_NOTIFICATIONS, parameters)
+        notifications = tuple(
+            Notification(*row) for row in cur.fetchall())
+    con.close()
 
     if not notifications:
         await message.answer('У вас нет активных уведомлений')
@@ -113,19 +175,8 @@ async def command_notifications_handler(message: Message) -> None:
 
     response_lst = ['Ваши активные уведомления:']
 
-    params = {
-        'temperature': 'Температура',
-        'humidity': 'Влажность',
-    }
-    conds = {
-        'less': 'меньше',
-        'greater': 'больше',
-        'equal': 'равна',
-    }
-
-    for i, n in enumerate(notifications, start=1):
-        param, cond, value = n[2:5]
-        response_lst.append(f'{i}) {params[param]} {conds[cond]} {value}')
+    for notification in notifications:
+        response_lst.append(f'({notification.id}) {notification}')
 
     await message.answer('\n'.join(response_lst))
 
@@ -137,24 +188,17 @@ async def command_setnotification_handler(
 ) -> None:
     await message.answer(
         'Выберите параметр для уведомления:',
-        reply_markup=get_parameters_keyboard()
+        reply_markup=PARAMETERS_MARKUP
     )
     await state.set_state(NotificationStates.waiting_parameter)
 
 
 @dp.callback_query(NotificationStates.waiting_parameter)
 async def process_parameter(callback: CallbackQuery, state: FSMContext):
-    if callback.data == 'back':
-        await callback.message.edit_text(
-            'Выберите параметр:',
-            reply_markup=get_parameters_keyboard()
-        )
-        return
-
     await state.update_data(parameter=callback.data)
     await callback.message.edit_text(
         'Выберите условие:',
-        reply_markup=get_conditions_keyboard()
+        reply_markup=CONDITIONS_MARKUP
     )
     await state.set_state(NotificationStates.waiting_condition)
     await callback.answer()
@@ -165,7 +209,7 @@ async def process_condition(callback: CallbackQuery, state: FSMContext):
     if callback.data == 'back':
         await callback.message.edit_text(
             'Выберите параметр:',
-            reply_markup=get_parameters_keyboard()
+            reply_markup=PARAMETERS_MARKUP
         )
         await state.set_state(NotificationStates.waiting_parameter)
         await callback.answer()
@@ -185,18 +229,19 @@ async def process_value(message: Message, state: FSMContext):
     try:
         value = float(message.text)
         data = await state.get_data()
-
-        db = sqlite3.connect('notifications.db')
-        cursor = db.cursor()
-        cursor.execute(
-            'INSERT INTO notifications \
-            (user_id, parameter, condition, value, created_at) VALUES \
-            (?, ?, ?, ?, ?)',
-            (message.from_user.id, data['parameter'], data['condition'], value,
-             datetime.now())
+        parameters = (
+            message.from_user.id,
+            data['parameter'],
+            data['condition'],
+            value,
+            datetime.now().isoformat(),
+            True
         )
-        db.commit()
-        db.close()
+
+        con = sqlite3.connect(DATABASE_PATH)
+        with con:
+            con.execute(INSERT_NOTIFICATION, parameters)
+        con.close()
 
         await message.answer('Уведомление успешно установлено!')
         await state.clear()
@@ -209,34 +254,37 @@ async def monitor_sensors(bot: Bot):
         current_temperature = get_temperature(ser)
         current_humidity = get_humidity(ser)
 
-        db = sqlite3.connect('notifications.db')
-        cursor = db.cursor()
-        cursor.execute('SELECT * FROM notifications WHERE is_active=1')
-        notifications = cursor.fetchall()
-        db.close()
+        con = sqlite3.connect(DATABASE_PATH)
+        with con:
+            cur = con.execute(SELECT_ACTIVE_NOTIFICATIONS)
+            notifications = tuple(
+                Notification(*row) for row in cur.fetchall())
+        con.close()
 
-        for n in notifications:
-            user_id, param, cond, value = n[1:5]
-            should_alert = False
+        for notification in notifications:
+            user_id = notification.user_id
+            parameter = notification.parameter
+            condition = notification.condition
+            value = notification.value
 
-            if param == 'temperature':
-                current = current_temperature
-            else:
-                current = current_humidity
+            match parameter:
+                case 'temperature':
+                    current = current_temperature
+                case 'humidity':
+                    current = current_humidity
 
             conditions = (
-                cond == 'less' and current < value,
-                cond == 'greater' and current > value,
-                cond == 'equal' and current == value
+                condition == 'less' and current < value,
+                condition == 'greater' and current > value,
+                condition == 'equal' and current == value
             )
 
-            if any(c for c in conditions):
-                should_alert = True
+            if not any(conditions):
+                continue
 
-            if should_alert:
-                message = 'Сработало уведомление!\n' \
-                          f'{param.capitalize()} сейчас {current}'
-                await bot.send_message(user_id, message)
+            id = notification.id
+            message = f'Сработало уведомление ({id}) {notification}'
+            await bot.send_message(user_id, message)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
