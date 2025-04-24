@@ -113,8 +113,19 @@ async def command_notifications_handler(message: Message) -> None:
 
     response_lst = ['Ваши активные уведомления:']
 
-    for n in notifications:
-        response_lst.append(f'{n[2]} {n[3]} {n[4]}')
+    params = {
+        'temperature': 'Температура',
+        'humidity': 'Влажность',
+    }
+    conds = {
+        'less': 'меньше',
+        'greater': 'больше',
+        'equal': 'равна',
+    }
+
+    for i, n in enumerate(notifications, start=1):
+        param, cond, value = n[2:5]
+        response_lst.append(f'{i}) {params[param]} {conds[cond]} {value}')
 
     await message.answer('\n'.join(response_lst))
 
@@ -205,7 +216,7 @@ async def monitor_sensors(bot: Bot):
         db.close()
 
         for n in notifications:
-            user_id, param, cond, value = n[1], n[2], n[3], n[4]
+            user_id, param, cond, value = n[1:5]
             should_alert = False
 
             if param == 'temperature':
