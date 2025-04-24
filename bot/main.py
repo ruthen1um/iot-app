@@ -1,202 +1,255 @@
+import asyncio
+import sqlite3
 from os import getenv
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    PicklePersistence,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    filters,
+from datetime import datetime
+from aiogram.filters import Command
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
-from sensors import find_arduino_port, get_temperature, get_humidity
+from sensors import get_temperature, get_humidity
 from serial import Serial
 
 TOKEN = getenv('TOKEN')
-PERSISTENCE_FILE = getenv('PERSISTENCE_FILE')
+PORT = getenv('PORT')
+
+# Интервал проверки условий для отправки напоминания
+CHECK_INTERVAL = 10
 
 START_MESSAGE = '''Привет. Данный бот позволяет просматривать значения
-температуры и влажности с датчиков в режиме реального времени.'''
-
-REMINDER_MESSAGE = '''Выберите параметр для установки напоминания.'''
-
-TEMPERATURE_MORE_THAN_MESSAGE = '''Введите значение температуры при превышении
-которого вы получите уведомление.'''
-
-TEMPERATURE_LESS_THAN_MESSAGE = '''Введите значение температуры при понижении
-ниже которого вы получите уведомление.'''
-
-HUMIDITY_MORE_THAN_MESSAGE = '''Введите значение влажности при превышении
-которого вы получите уведомление.'''
-
-HUMIDITY_LESS_THAN_MESSAGE = '''Введите значение влажности при понижении
-ниже которого вы получите уведомление.'''
-
-VALUE_SUCCESS_MESSAGE = 'Напоминание успешно запланировано.'
-
-CHOICES_FALLBACK_MESSAGE = 'Выберите один из предложенных вариантов.'
-
-VALUE_FALLBACK_MESSAGE = 'Введите целое число.'
-
-DEFAULT_FALLBACK_MESSAGE = 'Произошла ошибка. Возвращаю в главное меню.'
-
-MAIN_MENU, REMINDER_MENU, CHOOSING_REMINDER_VALUE = range(3)
-
-MAIN_KEYBOARD = [
-    ['Температура'],
-    ['Влажность'],
-    ['Напоминание'],
-]
-
-MAIN_MARKUP = ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
-
-REMINDER_KEYBOARD = [
-    ['Температура больше ...'],
-    ['Температура меньше ...'],
-    ['Влажность больше ...'],
-    ['Влажность меньше ...'],
-]
-
-REMINDER_MARKUP = ReplyKeyboardMarkup(REMINDER_KEYBOARD, resize_keyboard=True)
+температуры и влажности с датчиков в режиме реального времени'''
 
 
-async def start_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=START_MESSAGE,
-                                   reply_markup=MAIN_MARKUP)
-    return MAIN_MENU
+INIT_SCRIPT = '''
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    parameter TEXT,
+    condition TEXT,
+    value REAL,
+    created_at TIMESTAMP,
+    is_active BOOLEAN DEFAULT 1
+)
+'''
 
 
-async def sensors_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+def init_db():
+    db = sqlite3.connect('notifications.db')
+    cursor = db.cursor()
+    cursor.execute(INIT_SCRIPT)
+    db.commit()
+    db.close()
+
+
+class NotificationStates(StatesGroup):
+    waiting_parameter = State()
+    waiting_condition = State()
+    waiting_value = State()
+
+
+ser = Serial(PORT)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+
+def get_parameters_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text='Температура',
+                                  callback_data='temperature')],
+            [InlineKeyboardButton(text='Влажность', callback_data='humidity')]
+        ]
+    )
+
+
+def get_conditions_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text='<', callback_data='less'),
+                InlineKeyboardButton(text='=', callback_data='equal'),
+                InlineKeyboardButton(text='>', callback_data='greater')
+            ],
+            [InlineKeyboardButton(text='Назад', callback_data='back')]
+        ]
+    )
+
+
+@dp.message(Command('start'))
+async def command_start_handler(message: Message) -> None:
+    await message.answer(START_MESSAGE)
+
+
+@dp.message(Command('temperature'))
+async def command_temperature_handler(message: Message) -> None:
+    await message.answer(
+        f'Текущее значение температуры: {get_temperature(ser)}')
+
+
+@dp.message(Command('humidity'))
+async def command_humidity_handler(message: Message) -> None:
+    await message.answer(f'Текущее значение влажности: {get_humidity(ser)}')
+
+
+@dp.message(Command('notifications'))
+async def command_notifications_handler(message: Message) -> None:
+    db = sqlite3.connect('notifications.db')
+    cursor = db.cursor()
+    query = 'SELECT * FROM notifications WHERE user_id=? AND is_active=1'
+    cursor.execute(query, (message.from_user.id,))
+    notifications = cursor.fetchall()
+    db.close()
+
+    if not notifications:
+        await message.answer('У вас нет активных уведомлений')
+        return
+
+    response_lst = ['Ваши активные уведомления:']
+
+    for n in notifications:
+        response_lst.append(f'{n[2]} {n[3]} {n[4]}')
+
+    await message.answer('\n'.join(response_lst))
+
+
+@dp.message(Command('setnotification'))
+async def command_setnotification_handler(
+    message: Message,
+    state: FSMContext
 ) -> None:
-    functions = {
-        'Температура': lambda:
-            get_temperature(context.application.bot_data['serial']),
-        'Влажность': lambda:
-            get_humidity(context.application.bot_data['serial']),
-    }
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=functions[update.message.text]())
+    await message.answer(
+        'Выберите параметр для уведомления:',
+        reply_markup=get_parameters_keyboard()
+    )
+    await state.set_state(NotificationStates.waiting_parameter)
 
 
-async def reminder_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=REMINDER_MESSAGE,
-                                   reply_markup=REMINDER_MARKUP)
-    return REMINDER_MENU
+@dp.callback_query(NotificationStates.waiting_parameter)
+async def process_parameter(callback: CallbackQuery, state: FSMContext):
+    if callback.data == 'back':
+        await callback.message.edit_text(
+            'Выберите параметр:',
+            reply_markup=get_parameters_keyboard()
+        )
+        return
+
+    await state.update_data(parameter=callback.data)
+    await callback.message.edit_text(
+        'Выберите условие:',
+        reply_markup=get_conditions_keyboard()
+    )
+    await state.set_state(NotificationStates.waiting_condition)
+    await callback.answer()
 
 
-async def reminder_condition_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    options = {
-        'Температура больше ...': TEMPERATURE_MORE_THAN_MESSAGE,
-        'Температура меньше ...': TEMPERATURE_LESS_THAN_MESSAGE,
-        'Влажность больше ...': HUMIDITY_MORE_THAN_MESSAGE,
-        'Влажность меньше ...': HUMIDITY_LESS_THAN_MESSAGE,
-    }
+@dp.callback_query(NotificationStates.waiting_condition)
+async def process_condition(callback: CallbackQuery, state: FSMContext):
+    if callback.data == 'back':
+        await callback.message.edit_text(
+            'Выберите параметр:',
+            reply_markup=get_parameters_keyboard()
+        )
+        await state.set_state(NotificationStates.waiting_parameter)
+        await callback.answer()
+        return
 
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=options[update.message.text],
-                                   reply_markup=ReplyKeyboardRemove())
-    return CHOOSING_REMINDER_VALUE
-
-
-async def value_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    # TODO: implement system to send notifications
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=VALUE_SUCCESS_MESSAGE,
-                                   reply_markup=MAIN_MARKUP)
-    return MAIN_MENU
+    await state.update_data(condition=callback.data)
+    await callback.message.edit_text(
+        'Введите числовое значение:',
+        reply_markup=None
+    )
+    await state.set_state(NotificationStates.waiting_value)
+    await callback.answer()
 
 
-async def choices_fallback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=CHOICES_FALLBACK_MESSAGE)
+@dp.message(NotificationStates.waiting_value)
+async def process_value(message: Message, state: FSMContext):
+    try:
+        value = float(message.text)
+        data = await state.get_data()
+
+        db = sqlite3.connect('notifications.db')
+        cursor = db.cursor()
+        cursor.execute(
+            'INSERT INTO notifications \
+            (user_id, parameter, condition, value, created_at) VALUES \
+            (?, ?, ?, ?, ?)',
+            (message.from_user.id, data['parameter'], data['condition'], value,
+             datetime.now())
+        )
+        db.commit()
+        db.close()
+
+        await message.answer('Уведомление успешно установлено!')
+        await state.clear()
+    except ValueError:
+        await message.answer('Пожалуйста, введите корректное число')
 
 
-async def value_fallback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=VALUE_FALLBACK_MESSAGE)
+async def monitor_sensors(bot: Bot):
+    while True:
+        current_temperature = get_temperature(ser)
+        current_humidity = get_humidity(ser)
+
+        db = sqlite3.connect('notifications.db')
+        cursor = db.cursor()
+        cursor.execute('SELECT * FROM notifications WHERE is_active=1')
+        notifications = cursor.fetchall()
+        db.close()
+
+        for n in notifications:
+            user_id, param, cond, value = n[1], n[2], n[3], n[4]
+            should_alert = False
+
+            if param == 'temperature':
+                current = current_temperature
+            else:
+                current = current_humidity
+
+            conditions = (
+                cond == 'less' and current < value,
+                cond == 'greater' and current > value,
+                cond == 'equal' and current == value
+            )
+
+            if any(c for c in conditions):
+                should_alert = True
+
+            if should_alert:
+                message = 'Сработало уведомление!\n' \
+                          f'{param.capitalize()} сейчас {current}'
+                await bot.send_message(user_id, message)
+
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
-async def default_fallback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text=DEFAULT_FALLBACK_MESSAGE,
-                                   reply_markup=MAIN_MARKUP)
-    return MAIN_MENU
+async def main() -> None:
+    bot = Bot(token=TOKEN)
 
+    commands = [
+        BotCommand(command='start', description='начать работу с ботом'),
+        BotCommand(command='temperature', description='текущая температура'),
+        BotCommand(command='humidity', description='текущая влажность'),
+        BotCommand(command='notifications',
+                   description='активные уведомления'),
+        BotCommand(command='setnotification',
+                   description='установить уведомление'),
+    ]
+
+    await bot.set_my_commands(commands)
+
+    init_db()
+
+    asyncio.create_task(monitor_sensors(bot))
+
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .persistence(PicklePersistence(filepath=PERSISTENCE_FILE))
-        .build()
-    )
-
-    port = find_arduino_port()
-    if (port is None):
-        # TODO
-        pass
-
-    application.bot_data['serial'] = Serial(port, 9600, timeout=1)
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start_handler)],
-        states={
-            MAIN_MENU: [
-                MessageHandler(filters.Text([
-                    'Температура',
-                    'Влажность',
-                ]), sensors_handler),
-                MessageHandler(filters.Text(['Напоминание']),
-                               reminder_handler),
-                MessageHandler(filters.TEXT,
-                               choices_fallback_handler),
-            ],
-            REMINDER_MENU: [
-                MessageHandler(filters.Text([
-                    'Температура больше ...',
-                    'Температура меньше ...',
-                    'Влажность больше ...',
-                    'Влажность меньше ...',
-                ]), reminder_condition_handler),
-                MessageHandler(filters.TEXT,
-                               choices_fallback_handler),
-            ],
-            CHOOSING_REMINDER_VALUE: [
-                MessageHandler(filters.Regex(r'^-?[1-9]\d*$'),
-                               value_handler),
-                MessageHandler(filters.TEXT,
-                               value_fallback_handler),
-            ]
-        },
-        fallbacks=[MessageHandler(filters.TEXT, default_fallback_handler)],
-        name='conversation_handler',
-        persistent=True,
-    )
-
-    application.add_handler(conv_handler)
-    application.run_polling()
+    asyncio.run(main())
