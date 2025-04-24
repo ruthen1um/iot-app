@@ -38,17 +38,16 @@ CREATE TABLE IF NOT EXISTS notifications (
     parameter TEXT,
     condition TEXT,
     value REAL,
-    created_at TIMESTAMP,
-    is_active BOOLEAN
+    created_at TIMESTAMP
 )
 '''
 
-SELECT_ACTIVE_USER_NOTIFICATIONS = '''
-SELECT * FROM notifications WHERE user_id=? AND is_active=1
+SELECT_USER_NOTIFICATIONS = '''
+SELECT * FROM notifications WHERE user_id=?
 '''
 
-SELECT_ACTIVE_NOTIFICATIONS = '''
-SELECT * FROM notifications WHERE is_active=1
+SELECT_NOTIFICATIONS = '''
+SELECT * FROM notifications
 '''
 
 INSERT_NOTIFICATION = '''
@@ -57,9 +56,16 @@ INSERT INTO notifications (
     parameter,
     condition,
     value,
-    created_at,
-    is_active
-) VALUES (?, ?, ?, ?, ?, ?)
+    created_at
+) VALUES (?, ?, ?, ?, ?)
+'''
+
+SELECT_USER_NOTIFICATION_BY_ID = '''
+SELECT 1 FROM notifications WHERE id=? AND user_id=?
+'''
+
+DELETE_NOTIFICATION = '''
+DELETE FROM notifications WHERE user_id=? AND id=?
 '''
 
 TEMPERATURE_CALLBACK_DATA = 'temperature'
@@ -97,7 +103,6 @@ class Notification:
     condition: object
     value: object
     created_at: object
-    is_active: object
 
     def __str__(self):
         return (
@@ -124,22 +129,19 @@ class Notification:
         return conditions.get(condition)
 
 
-class NotificationStates(StatesGroup):
+class SetNotificationStates(StatesGroup):
     waiting_parameter = State()
     waiting_condition = State()
     waiting_value = State()
 
 
+class DeleteNotificationStates(StatesGroup):
+    waiting_id = State()
+
+
 ser = Serial(PORT)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
-
-def init_db():
-    con = sqlite3.connect(DATABASE_PATH)
-    with con:
-        con.execute(CREATE_NOTIFICATIONS_TABLE)
-    con.close()
 
 
 @dp.message(Command('start'))
@@ -163,8 +165,10 @@ async def command_humidity_handler(message: Message) -> None:
 async def command_notifications_handler(message: Message) -> None:
     con = sqlite3.connect(DATABASE_PATH)
     with con:
-        parameters = (message.from_user.id,)
-        cur = con.execute(SELECT_ACTIVE_USER_NOTIFICATIONS, parameters)
+        cur = con.execute(
+            SELECT_USER_NOTIFICATIONS,
+            (message.from_user.id,)
+        )
         notifications = tuple(
             Notification(*row) for row in cur.fetchall())
     con.close()
@@ -190,28 +194,34 @@ async def command_setnotification_handler(
         'Выберите параметр для уведомления:',
         reply_markup=PARAMETERS_MARKUP
     )
-    await state.set_state(NotificationStates.waiting_parameter)
+    await state.set_state(SetNotificationStates.waiting_parameter)
 
 
-@dp.callback_query(NotificationStates.waiting_parameter)
-async def process_parameter(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(SetNotificationStates.waiting_parameter)
+async def process_parameter(
+    callback: CallbackQuery,
+    state: FSMContext
+) -> None:
     await state.update_data(parameter=callback.data)
     await callback.message.edit_text(
         'Выберите условие:',
         reply_markup=CONDITIONS_MARKUP
     )
-    await state.set_state(NotificationStates.waiting_condition)
+    await state.set_state(SetNotificationStates.waiting_condition)
     await callback.answer()
 
 
-@dp.callback_query(NotificationStates.waiting_condition)
-async def process_condition(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(SetNotificationStates.waiting_condition)
+async def process_condition(
+    callback: CallbackQuery,
+    state: FSMContext
+) -> None:
     if callback.data == 'back':
         await callback.message.edit_text(
             'Выберите параметр:',
             reply_markup=PARAMETERS_MARKUP
         )
-        await state.set_state(NotificationStates.waiting_parameter)
+        await state.set_state(SetNotificationStates.waiting_parameter)
         await callback.answer()
         return
 
@@ -220,43 +230,116 @@ async def process_condition(callback: CallbackQuery, state: FSMContext):
         'Введите числовое значение:',
         reply_markup=None
     )
-    await state.set_state(NotificationStates.waiting_value)
+    await state.set_state(SetNotificationStates.waiting_value)
     await callback.answer()
 
 
-@dp.message(NotificationStates.waiting_value)
-async def process_value(message: Message, state: FSMContext):
+@dp.message(SetNotificationStates.waiting_value)
+async def process_value(message: Message, state: FSMContext) -> None:
     try:
         value = float(message.text)
         data = await state.get_data()
+
         parameters = (
             message.from_user.id,
             data['parameter'],
             data['condition'],
             value,
             datetime.now().isoformat(),
-            True
         )
 
         con = sqlite3.connect(DATABASE_PATH)
         with con:
-            con.execute(INSERT_NOTIFICATION, parameters)
+            con.execute(
+                INSERT_NOTIFICATION,
+                parameters
+            )
         con.close()
 
         await message.answer('Уведомление успешно установлено!')
         await state.clear()
+
     except ValueError:
         await message.answer('Пожалуйста, введите корректное число')
 
 
-async def monitor_sensors(bot: Bot):
+@dp.message(Command('deletenotification'))
+async def command_deletenotification_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
+    con = sqlite3.connect(DATABASE_PATH)
+    with con:
+        cur = con.execute(
+            SELECT_USER_NOTIFICATIONS,
+            (message.from_user.id,)
+        )
+        notification = cur.fetchone()
+    con.close()
+
+    if notification:
+        await message.answer('Введите id уведомления для удаления')
+    else:
+        await message.answer('У вас нет активных уведомлений для удаления')
+
+    await state.set_state(DeleteNotificationStates.waiting_id)
+
+
+@dp.message(DeleteNotificationStates.waiting_id)
+async def process_delete_id(message: Message, state: FSMContext) -> None:
+    try:
+        notification_id = int(message.text)
+        con = sqlite3.connect(DATABASE_PATH)
+        with con:
+            cur = con.execute(
+                SELECT_USER_NOTIFICATION_BY_ID,
+                (notification_id, message.from_user.id)
+            )
+            if not cur.fetchone():
+                await message.answer("Уведомление с таким id не найдено")
+                return
+
+            con.execute(
+                DELETE_NOTIFICATION,
+                (message.from_user.id, notification_id)
+            )
+        con.close()
+        await state.clear()
+        await message.answer("Уведомление было успешно удалено!")
+
+    except ValueError:
+        await message.answer('Пожалуйста, введите корректное число')
+
+
+@dp.message(Command('cancel'))
+async def command_cancel_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer('Нет активных операций для отмены')
+        return
+
+    await state.clear()
+    await message.answer('Операция отменена')
+
+
+def init_db() -> None:
+    con = sqlite3.connect(DATABASE_PATH)
+    with con:
+        con.execute(CREATE_NOTIFICATIONS_TABLE)
+    con.close()
+
+
+async def monitor_sensors(bot: Bot) -> None:
     while True:
         current_temperature = get_temperature(ser)
         current_humidity = get_humidity(ser)
 
         con = sqlite3.connect(DATABASE_PATH)
         with con:
-            cur = con.execute(SELECT_ACTIVE_NOTIFICATIONS)
+            cur = con.execute(SELECT_NOTIFICATIONS)
             notifications = tuple(
                 Notification(*row) for row in cur.fetchall())
         con.close()
@@ -300,6 +383,10 @@ async def main() -> None:
                    description='активные уведомления'),
         BotCommand(command='setnotification',
                    description='установить уведомление'),
+        BotCommand(command='deletenotification',
+                   description='удалить уведомление'),
+        BotCommand(command='cancel',
+                   description='отменить операцию'),
     ]
 
     await bot.set_my_commands(commands)
