@@ -2,7 +2,7 @@ import asyncio
 import sqlite3
 from os import getenv
 from datetime import datetime
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter, and_f
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -136,7 +136,7 @@ class SetNotificationStates(StatesGroup):
 
 
 class DeleteNotificationStates(StatesGroup):
-    waiting_id = State()
+    waiting_index = State()
 
 
 ser = Serial(PORT)
@@ -144,25 +144,47 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 
-@dp.message(Command('start'))
-async def command_start_handler(message: Message) -> None:
+@dp.message(and_f(StateFilter(None), Command('start')))
+async def command_start_handler(message: Message, state: FSMContext) -> None:
     await message.answer(START_MESSAGE)
 
 
-@dp.message(Command('temperature'))
-async def command_temperature_handler(message: Message) -> None:
+@dp.message(Command('cancel'))
+async def command_cancel_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer('Сейчас не выполняется ни одна операция')
+    else:
+        await state.clear()
+        await message.answer('Операция отменена')
+
+
+@dp.message(and_f(StateFilter(None), Command('temperature')))
+async def command_temperature_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
     temperature = get_temperature(ser)
     await message.answer(f'Текущее значение температуры: {temperature}')
 
 
-@dp.message(Command('humidity'))
-async def command_humidity_handler(message: Message) -> None:
+@dp.message(and_f(StateFilter(None), Command('humidity')))
+async def command_humidity_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
     humidity = get_humidity(ser)
     await message.answer(f'Текущее значение влажности: {humidity}')
 
 
-@dp.message(Command('notifications'))
-async def command_notifications_handler(message: Message) -> None:
+@dp.message(and_f(StateFilter(None), Command('notifications')))
+async def command_notifications_handler(
+    message: Message,
+    state: FSMContext
+) -> None:
     con = sqlite3.connect(DATABASE_PATH)
     with con:
         cur = con.execute(
@@ -179,13 +201,13 @@ async def command_notifications_handler(message: Message) -> None:
 
     response_lst = ['Ваши активные уведомления:']
 
-    for notification in notifications:
-        response_lst.append(f'({notification.id}) {notification}')
+    for idx, notification in enumerate(notifications, start=1):
+        response_lst.append(f'({idx}) {notification}')
 
     await message.answer('\n'.join(response_lst))
 
 
-@dp.message(Command('setnotification'))
+@dp.message(and_f(StateFilter(None), Command('setnotification')))
 async def command_setnotification_handler(
     message: Message,
     state: FSMContext
@@ -263,7 +285,7 @@ async def process_value(message: Message, state: FSMContext) -> None:
         await message.answer('Пожалуйста, введите корректное число')
 
 
-@dp.message(Command('deletenotification'))
+@dp.message(and_f(StateFilter(None), Command('deletenotification')))
 async def command_deletenotification_handler(
     message: Message,
     state: FSMContext
@@ -274,21 +296,32 @@ async def command_deletenotification_handler(
             SELECT_USER_NOTIFICATIONS,
             (message.from_user.id,)
         )
-        notification = cur.fetchone()
+        notifications = [Notification(*row) for row in cur.fetchall()]
     con.close()
 
-    if notification:
-        await message.answer('Введите id уведомления для удаления')
-    else:
+    if not notifications:
         await message.answer('У вас нет активных уведомлений для удаления')
+        return
 
-    await state.set_state(DeleteNotificationStates.waiting_id)
+    await message.answer('Введите номер уведомления для удаления')
+    notification_map = {i+1: n.id for i, n in enumerate(notifications)}
+    await state.update_data(notification_map=notification_map)
+    await state.set_state(DeleteNotificationStates.waiting_index)
 
 
-@dp.message(DeleteNotificationStates.waiting_id)
-async def process_delete_id(message: Message, state: FSMContext) -> None:
+@dp.message(DeleteNotificationStates.waiting_index)
+async def process_delete_index(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    notification_map = data.get('notification_map')
     try:
-        notification_id = int(message.text)
+        notification_index = int(message.text)
+        if notification_index not in notification_map:
+            await message.answer(
+                'Пожалуйста, введите корректный номер уведомления')
+            return
+
+        notification_id = notification_map[notification_index]
+
         con = sqlite3.connect(DATABASE_PATH)
         with con:
             cur = con.execute(
@@ -296,7 +329,7 @@ async def process_delete_id(message: Message, state: FSMContext) -> None:
                 (notification_id, message.from_user.id)
             )
             if not cur.fetchone():
-                await message.answer("Уведомление с таким id не найдено")
+                await message.answer("Уведомление с таким номером не найдено")
                 return
 
             con.execute(
@@ -309,20 +342,6 @@ async def process_delete_id(message: Message, state: FSMContext) -> None:
 
     except ValueError:
         await message.answer('Пожалуйста, введите корректное число')
-
-
-@dp.message(Command('cancel'))
-async def command_cancel_handler(
-    message: Message,
-    state: FSMContext
-) -> None:
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer('Нет активных операций для отмены')
-        return
-
-    await state.clear()
-    await message.answer('Операция отменена')
 
 
 def init_db() -> None:
